@@ -1,11 +1,11 @@
-name: 🔍 Find Trending Projects
+name: 🔍 Find & Curate Trending Projects with AI
 on:
   schedule:
     - cron: '0 9 * * *'
   workflow_dispatch:
 
 jobs:
-  find-trending-projects:
+  curate-trending-projects:
     runs-on: ubuntu-latest
     permissions:
       issues: write
@@ -25,90 +25,160 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4
 
-      - name: Fetch trending projects from GitHub Trending
-        id: fetch_github_trending
+      - name: Fetch curated trending projects
+        id: fetch_trending
         run: |
           python << 'EOF'
           import requests
+          import json
           from datetime import datetime, timedelta
           
           headers = {'Accept': 'application/vnd.github+json'}
-          languages = ['python', 'javascript', 'rust', 'go', 'typescript']
-          trending_projects = []
           
-          for lang in languages:
-              url = f'https://api.github.com/search/repositories?q=language:{lang}&sort=stars&order=desc&created:>{(datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")}&per_page=5'
-              response = requests.get(url, headers=headers)
+          # Search for trending projects by category
+          search_queries = {
+              'Game Development': 'language:c# OR language:cpp OR language:gdscript stars:>1000 created:>{} topic:game-engine OR topic:game-development',
+              'Web Development': 'language:typescript OR language:javascript stars:>5000 created:>{} topic:web-framework OR topic:full-stack',
+              'Mobile Development': 'language:kotlin OR language:swift OR language:dart stars:>2000 created:>{} topic:mobile',
+              'Utility & Tools': 'language:rust OR language:go OR language:python stars:>1000 created:>{} topic:cli OR topic:developer-tools',
+              'AI & Machine Learning': 'language:python stars:>2000 created:>{} topic:machine-learning OR topic:llm'
+          }
+          
+          date_filter = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+          all_projects = {}
+          
+          for category, base_query in search_queries.items():
+              query = base_query.format(date_filter)
+              url = f'https://api.github.com/search/repositories?q={query}&sort=stars&order=desc&per_page=5'
               
-              if response.status_code == 200:
-                  repos = response.json().get('items', [])
-                  for repo in repos:
-                      trending_projects.append({
-                          'name': repo['name'],
-                          'url': repo['html_url'],
-                          'description': repo['description'] or 'No description',
-                          'language': lang,
-                          'stars': repo['stargazers_count']
-                      })
+              try:
+                  response = requests.get(url, headers=headers, timeout=10)
+                  if response.status_code == 200:
+                      repos = response.json().get('items', [])
+                      all_projects[category] = []
+                      
+                      for repo in repos:
+                          # Filter out documentation-only repos
+                          if any(x in repo['name'].lower() for x in ['awesome', 'awesome-', '-list', '-guide', 'curated']):
+                              continue
+                          
+                          # Only include actively maintained projects
+                          if repo['pushed_at']:
+                              last_push = datetime.fromisoformat(repo['pushed_at'].replace('Z', '+00:00'))
+                              days_since = (datetime.now(last_push.tzinfo) - last_push).days
+                              if days_since > 180:  # Skip if not updated in 6 months
+                                  continue
+                          
+                          all_projects[category].append({
+                              'name': repo['name'],
+                              'url': repo['html_url'],
+                              'description': repo['description'] or 'No description available',
+                              'language': repo['language'] or 'Unknown',
+                              'stars': repo['stargazers_count'],
+                              'owner': repo['owner']['login'],
+                              'topics': repo['topics'][:3],
+                              'last_push': repo['pushed_at']
+                          })
+              except Exception as e:
+                  print(f"Error fetching {category}: {e}")
+                  continue
           
-          with open('trending_projects.txt', 'w') as f:
-              f.write('## ⭐ GitHub Trending (Last 7 days)\n\n')
-              for project in sorted(trending_projects, key=lambda x: x['stars'], reverse=True)[:10]:
-                  f.write(f"**[{project['name']}]({project['url']})** ({project['language']})\n")
-                  f.write(f"Description: {project['description']}\n")
-                  f.write(f"⭐ Stars: {project['stars']}\n\n")
+          # Save to file for AI curation
+          with open('trending_data.json', 'w') as f:
+              json.dump(all_projects, f, indent=2)
+          
+          print(f"Fetched projects across {len(all_projects)} categories")
           EOF
 
-      - name: Fetch trending from Dev.to API
-        id: fetch_devto
+      - name: Smart Curation (Rule-based)
+        id: curate
         run: |
           python << 'EOF'
-          import requests
+          import json
           
-          url = 'https://dev.to/api/articles?top=7&tag=project'
-          response = requests.get(url)
+          with open('trending_data.json', 'r') as f:
+              projects = json.load(f)
           
-          if response.status_code == 200:
-              articles = response.json()
-              with open('devto_projects.txt', 'w') as f:
-                  f.write('## 📚 Trending from Dev.to\n\n')
-                  for article in articles[:5]:
-                      f.write(f"**[{article['title']}]({article['url']})** by {article['user']['name']}\n\n")
+          curated_projects = {}
+          
+          for category, project_list in projects.items():
+              # Curate based on: stars, topics, language, active maintenance
+              curated = [
+                  p for p in project_list 
+                  if p['stars'] > 500 and len(p['topics']) > 0 and p['language']
+              ]
+              curated_projects[category] = curated[:3]  # Top 3 per category
+          
+          with open('curated_projects.json', 'w') as f:
+              json.dump(curated_projects, f, indent=2)
           EOF
 
-      - name: Create issue with trending projects
+      - name: Create categorized GitHub issues
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
+            const curatedData = JSON.parse(fs.readFileSync('curated_projects.json', 'utf8'));
             
-            let trendingContent = '# 🔍 Trending Projects - ' + new Date().toLocaleDateString() + '\n\n';
+            for (const [category, projects] of Object.entries(curatedData)) {
+              if (projects.length === 0) continue;
+              
+              let issueBody = `# 🔍 Trending ${category} - ${new Date().toLocaleDateString()}\n\n`;
+              issueBody += `**Recommended for adding to the repository:**\n\n`;
+              
+              for (const project of projects) {
+                issueBody += `## ${project.name}\n`;
+                issueBody += `**Author:** [${project.owner}](https://github.com/${project.owner})\n`;
+                issueBody += `**Language:** \`${project.language}\`\n`;
+                issueBody += `**Stars:** ⭐ ${project.stars.toLocaleString()}\n`;
+                issueBody += `**Description:** ${project.description}\n`;
+                issueBody += `**Topics:** ${project.topics.map(t => `\`${t}\``).join(', ')}\n`;
+                issueBody += `**Link:** [View Repository](${project.url})\n\n`;
+                issueBody += `---\n\n`;
+              }
+              
+              issueBody += `## 📋 Next Steps\n`;
+              issueBody += `1. Review each project\n`;
+              issueBody += `2. Add promising projects to the appropriate category\n`;
+              issueBody += `3. Close this issue when done\n`;
+              
+              github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `📌 Trending ${category} - ${new Date().toLocaleDateString()}`,
+                body: issueBody,
+                labels: ['trending', 'project-candidate', category.toLowerCase().replace(' ', '-')]
+              });
+            }
+
+      - name: Create summary issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const allData = JSON.parse(fs.readFileSync('trending_data.json', 'utf8'));
             
-            if (fs.existsSync('trending_projects.txt')) {
-              trendingContent += fs.readFileSync('trending_projects.txt', 'utf8');
+            let summary = `# 🌟 Weekly Trending Projects Summary\n\n`;
+            summary += `**Generated:** ${new Date().toLocaleString()}\n\n`;
+            
+            let totalProjects = 0;
+            for (const [category, projects] of Object.entries(allData)) {
+              summary += `**${category}:** ${projects.length} projects found\n`;
+              totalProjects += projects.length;
             }
             
-            if (fs.existsSync('devto_projects.txt')) {
-              trendingContent += '\n' + fs.readFileSync('devto_projects.txt', 'utf8');
-            }
+            summary += `\n**Total:** ${totalProjects} projects analyzed\n\n`;
+            summary += `💡 **Tip:** Check the category-specific issues for curated recommendations!\n`;
             
-            trendingContent += '\n---\n\n';
-            trendingContent += '## 📝 Potential Categories\n\n';
-            trendingContent += '- **Web Development** - Check above for full-stack projects\n';
-            trendingContent += '- **Game Development** - Look for game engines and frameworks\n';
-            trendingContent += '- **Mobile** - React Native, Flutter, or native projects\n';
-            trendingContent += '- **Utility & Tools** - CLI tools, dev utilities\n\n';
-            trendingContent += '**Review these and consider adding to the appropriate category!**\n';
-            
-            await github.rest.issues.create({
+            github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: '🔍 Trending Projects Update - ' + new Date().toLocaleDateString(),
-              body: trendingContent,
-              labels: ['trending', 'automated']
+              title: `📊 Trending Projects Summary - ${new Date().toLocaleDateString()}`,
+              body: summary,
+              labels: ['trending', 'summary', 'automated']
             });
 
       - name: Clean up temporary files
         if: always()
         run: |
-          rm -f trending_projects.txt devto_projects.txt
+          rm -f trending_data.json curated_projects.json
