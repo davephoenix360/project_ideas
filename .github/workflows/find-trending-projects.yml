@@ -1,0 +1,114 @@
+name: 🔍 Find Trending Projects
+on:
+  schedule:
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+
+jobs:
+  find-trending-projects:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4
+
+      - name: Fetch trending projects from GitHub Trending
+        id: fetch_github_trending
+        run: |
+          python << 'EOF'
+          import requests
+          from datetime import datetime, timedelta
+          
+          headers = {'Accept': 'application/vnd.github+json'}
+          languages = ['python', 'javascript', 'rust', 'go', 'typescript']
+          trending_projects = []
+          
+          for lang in languages:
+              url = f'https://api.github.com/search/repositories?q=language:{lang}&sort=stars&order=desc&created:>{(datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")}&per_page=5'
+              response = requests.get(url, headers=headers)
+              
+              if response.status_code == 200:
+                  repos = response.json().get('items', [])
+                  for repo in repos:
+                      trending_projects.append({
+                          'name': repo['name'],
+                          'url': repo['html_url'],
+                          'description': repo['description'] or 'No description',
+                          'language': lang,
+                          'stars': repo['stargazers_count']
+                      })
+          
+          with open('trending_projects.txt', 'w') as f:
+              f.write('## ⭐ GitHub Trending (Last 7 days)\n\n')
+              for project in sorted(trending_projects, key=lambda x: x['stars'], reverse=True)[:10]:
+                  f.write(f"**[{project['name']}]({project['url']})** ({project['language']})\n")
+                  f.write(f"Description: {project['description']}\n")
+                  f.write(f"⭐ Stars: {project['stars']}\n\n")
+          EOF
+
+      - name: Fetch trending from Dev.to API
+        id: fetch_devto
+        run: |
+          python << 'EOF'
+          import requests
+          
+          url = 'https://dev.to/api/articles?top=7&tag=project'
+          response = requests.get(url)
+          
+          if response.status_code == 200:
+              articles = response.json()
+              with open('devto_projects.txt', 'w') as f:
+                  f.write('## 📚 Trending from Dev.to\n\n')
+                  for article in articles[:5]:
+                      f.write(f"**[{article['title']}]({article['url']})** by {article['user']['name']}\n\n")
+          EOF
+
+      - name: Create issue with trending projects
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            let trendingContent = '# 🔍 Trending Projects - ' + new Date().toLocaleDateString() + '\n\n';
+            
+            if (fs.existsSync('trending_projects.txt')) {
+              trendingContent += fs.readFileSync('trending_projects.txt', 'utf8');
+            }
+            
+            if (fs.existsSync('devto_projects.txt')) {
+              trendingContent += '\n' + fs.readFileSync('devto_projects.txt', 'utf8');
+            }
+            
+            trendingContent += '\n---\n\n';
+            trendingContent += '## 📝 Potential Categories\n\n';
+            trendingContent += '- **Web Development** - Check above for full-stack projects\n';
+            trendingContent += '- **Game Development** - Look for game engines and frameworks\n';
+            trendingContent += '- **Mobile** - React Native, Flutter, or native projects\n';
+            trendingContent += '- **Utility & Tools** - CLI tools, dev utilities\n\n';
+            trendingContent += '**Review these and consider adding to the appropriate category!**\n';
+            
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '🔍 Trending Projects Update - ' + new Date().toLocaleDateString(),
+              body: trendingContent,
+              labels: ['trending', 'automated']
+            });
+
+      - name: Clean up temporary files
+        if: always()
+        run: |
+          rm -f trending_projects.txt devto_projects.txt
